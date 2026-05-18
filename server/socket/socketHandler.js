@@ -2,6 +2,23 @@ import Message from "../models/Message.js";
 import Poll from "../models/Poll.js";
 
 const roomUsers = new Map();
+const roomScreenShare = new Map();
+const roomMediaStates = new Map();
+
+const getMediaStatesObject = (roomId) => {
+  const states = roomMediaStates.get(roomId);
+  if (!states) return {};
+  return Object.fromEntries(states.entries());
+};
+
+const clearParticipantState = (roomId, socketId) => {
+  if (roomMediaStates.has(roomId)) {
+    roomMediaStates.get(roomId).delete(socketId);
+    if (roomMediaStates.get(roomId).size === 0) roomMediaStates.delete(roomId);
+  }
+  const activeShare = roomScreenShare.get(roomId);
+  if (activeShare?.socketId === socketId) roomScreenShare.delete(roomId);
+};
 
 const socketHandler = (io) => {
   io.on("connection", (socket) => {
@@ -15,12 +32,23 @@ const socketHandler = (io) => {
 
       socket.to(roomId).emit("user-joined", { socketId: socket.id, user });
       io.to(roomId).emit("room-users", Array.from(roomUsers.get(roomId).entries()));
+
+      const activeShare = roomScreenShare.get(roomId);
+      if (activeShare) {
+        socket.emit("screen-share-start", activeShare);
+      }
+
+      const mediaStates = getMediaStatesObject(roomId);
+      if (Object.keys(mediaStates).length > 0) {
+        socket.emit("room-media-states", mediaStates);
+      }
     });
 
     socket.on("leave-room", ({ roomId }) => {
       socket.leave(roomId);
       if (roomUsers.has(roomId)) {
         roomUsers.get(roomId).delete(socket.id);
+        clearParticipantState(roomId, socket.id);
         io.to(roomId).emit("user-left", { socketId: socket.id });
       }
     });
@@ -117,17 +145,32 @@ const socketHandler = (io) => {
     });
 
     socket.on("screen-share-start", ({ roomId, user }) => {
-      io.to(roomId).emit("screen-share-start", { user });
+      const payload = { user, socketId: socket.id };
+      roomScreenShare.set(roomId, payload);
+      io.to(roomId).emit("screen-share-start", payload);
     });
 
-    socket.on("screen-share-stop", ({ roomId, user }) => {
-      io.to(roomId).emit("screen-share-stop", { user });
+    socket.on("screen-share-stop", ({ roomId }) => {
+      const activeShare = roomScreenShare.get(roomId);
+      if (activeShare?.socketId === socket.id) {
+        roomScreenShare.delete(roomId);
+      }
+      io.to(roomId).emit("screen-share-stop", { socketId: socket.id });
+    });
+
+    socket.on("media-state-changed", ({ roomId, cam, mic }) => {
+      if (!roomId || !socket.rooms.has(roomId)) return;
+      if (typeof cam !== "boolean" || typeof mic !== "boolean") return;
+      if (!roomMediaStates.has(roomId)) roomMediaStates.set(roomId, new Map());
+      roomMediaStates.get(roomId).set(socket.id, { cam, mic });
+      socket.to(roomId).emit("media-state-changed", { socketId: socket.id, cam, mic });
     });
 
     socket.on("disconnect", () => {
       const { roomId } = socket.data;
       if (roomId && roomUsers.has(roomId)) {
         roomUsers.get(roomId).delete(socket.id);
+        clearParticipantState(roomId, socket.id);
         socket.to(roomId).emit("user-left", { socketId: socket.id });
       }
     });

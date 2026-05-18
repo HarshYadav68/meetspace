@@ -9,6 +9,7 @@ import { useAuth } from "../context/AuthContext";
 import useSocket from "../hooks/useSocket";
 import useWebRTC from "../hooks/useWebRTC";
 import api from "../utils/api";
+import { getDisplaySurface, getLoopPreventionTip, requestScreenShare } from "../utils/screenShare";
 
 const Meeting = () => {
   const { roomId } = useParams();
@@ -16,6 +17,8 @@ const Meeting = () => {
   const { user } = useAuth();
   const { socket, connected: isSocketConnected } = useSocket(Boolean(user));
   const localVideoRef = useRef(null);
+  const stoppingShareRef = useRef(false);
+  const screenSharingSocketIdRef = useRef(null);
   const [messages, setMessages] = useState([]);
   const [showBoard, setShowBoard] = useState(false);
   const [showPoll, setShowPoll] = useState(false);
@@ -23,6 +26,9 @@ const Meeting = () => {
   const [toasts, setToasts] = useState([]);
   const [meetingInfo, setMeetingInfo] = useState(null);
   const [screenSharingBy, setScreenSharingBy] = useState(null);
+  const [screenSharingSocketId, setScreenSharingSocketId] = useState(null);
+  const [participants, setParticipants] = useState({});
+  const [participantMedia, setParticipantMedia] = useState({});
   const [floatingReactions, setFloatingReactions] = useState([]);
   const [media, setMedia] = useState({ mic: true, cam: true });
 
@@ -30,8 +36,24 @@ const Meeting = () => {
     if (!user || !meetingInfo?.host?._id) return false;
     return String(meetingInfo.host._id) === String(user._id);
   }, [meetingInfo, user]);
-  const { localStream, remoteStreams, startLocalStream, createPeerConnection, handleRoomUsers, replaceVideoTrack, peerConnections } =
-    useWebRTC(socket, roomId, user);
+  const {
+    localStream,
+    remoteStreams,
+    startLocalStream,
+    getLocalStream,
+    createPeerConnection,
+    handleRoomUsers,
+    beginScreenShare,
+    endScreenShare,
+    removeRemotePeer,
+    peerConnections,
+  } = useWebRTC(socket, roomId, user);
+
+  const isLocalScreenSharing = screenSharingSocketId === socket?.id;
+
+  useEffect(() => {
+    screenSharingSocketIdRef.current = screenSharingSocketId;
+  }, [screenSharingSocketId]);
 
   const pushToast = useCallback((message, type = "error") => {
     const id = crypto.randomUUID();
@@ -40,6 +62,14 @@ const Meeting = () => {
       setToasts((prev) => prev.filter((toast) => toast.id !== id));
     }, 3500);
   }, []);
+
+  const broadcastMediaState = useCallback(
+    (nextMedia) => {
+      if (!socket?.connected || !roomId) return;
+      socket.emit("media-state-changed", { roomId, cam: nextMedia.cam, mic: nextMedia.mic });
+    },
+    [roomId, socket]
+  );
 
   useEffect(() => {
     if (!user || !socket || !roomId) return;
@@ -69,6 +99,24 @@ const Meeting = () => {
       mounted = false;
     };
   }, [startLocalStream, user]);
+
+  useEffect(() => {
+    const el = localVideoRef.current;
+    if (!el || !localStream) return;
+    if (isLocalScreenSharing) {
+      el.srcObject = null;
+      return;
+    }
+    if (el.srcObject !== localStream) el.srcObject = localStream;
+    el.play().catch(() => {});
+  }, [isLocalScreenSharing, localStream, media.cam, screenSharingSocketId]);
+
+  useEffect(() => {
+    if (!localStream) return;
+    localStream.getAudioTracks().forEach((track) => {
+      track.enabled = media.mic;
+    });
+  }, [localStream, media.mic]);
 
   useEffect(() => {
     const loadMeeting = async () => {
@@ -116,7 +164,39 @@ const Meeting = () => {
 
   useEffect(() => {
     if (!socket) return;
-    socket.on("room-users", handleRoomUsers);
+    const onRoomUsers = (entries) => {
+      const next = {};
+      entries.forEach(([socketId, participant]) => {
+        next[socketId] = participant;
+      });
+      setParticipants(next);
+      handleRoomUsers(entries);
+    };
+
+    socket.on("room-users", onRoomUsers);
+    socket.on("user-joined", ({ socketId, user: joinedUser }) => {
+      setParticipants((prev) => ({ ...prev, [socketId]: joinedUser }));
+    });
+    socket.on("user-left", ({ socketId: leftId }) => {
+      removeRemotePeer(leftId);
+      setParticipants((prev) => {
+        const next = { ...prev };
+        delete next[leftId];
+        return next;
+      });
+      setParticipantMedia((prev) => {
+        const next = { ...prev };
+        delete next[leftId];
+        return next;
+      });
+      setScreenSharingSocketId((current) => {
+        if (current === leftId) setScreenSharingBy(null);
+        return current === leftId ? null : current;
+      });
+    });
+    socket.on("media-state-changed", ({ socketId: fromId, cam, mic }) => {
+      setParticipantMedia((prev) => ({ ...prev, [fromId]: { cam, mic } }));
+    });
     socket.on("offer", async ({ offer, from }) => {
       const existingPc = peerConnections.current[from];
       if (existingPc?.signalingState === "stable" && existingPc.currentRemoteDescription) return;
@@ -145,10 +225,31 @@ const Meeting = () => {
         setFloatingReactions((prev) => prev.slice(1));
       }, 1600);
     });
-    socket.on("screen-share-start", ({ user: u }) => setScreenSharingBy(u?.name || "Someone"));
-    socket.on("screen-share-stop", () => setScreenSharingBy(null));
+    socket.on("screen-share-start", ({ user: u, socketId: sharerId }) => {
+      if (!sharerId) return;
+      setScreenSharingSocketId(sharerId);
+      setScreenSharingBy(u?.name || "Someone");
+    });
+    socket.on("screen-share-stop", ({ socketId: sharerId }) => {
+      if (!sharerId) return;
+      setScreenSharingSocketId((current) => {
+        if (current === sharerId) {
+          setScreenSharingBy(null);
+          return null;
+        }
+        return current;
+      });
+    });
+    socket.on("room-media-states", (states) => {
+      if (states && typeof states === "object") {
+        setParticipantMedia((prev) => ({ ...prev, ...states }));
+      }
+    });
     return () => {
-      socket.off("room-users");
+      socket.off("room-users", onRoomUsers);
+      socket.off("user-joined");
+      socket.off("user-left");
+      socket.off("media-state-changed");
       socket.off("offer");
       socket.off("answer");
       socket.off("ice-candidate");
@@ -156,23 +257,43 @@ const Meeting = () => {
       socket.off("receive-reaction");
       socket.off("screen-share-start");
       socket.off("screen-share-stop");
+      socket.off("room-media-states");
     };
-  }, [createPeerConnection, handleRoomUsers, localStream, peerConnections, socket, startLocalStream]);
+  }, [createPeerConnection, handleRoomUsers, localStream, peerConnections, removeRemotePeer, socket, startLocalStream]);
 
-  const toggleMic = () => {
-    const stream = localStream;
-    if (!stream) return;
-    const enabled = !media.mic;
+  useEffect(() => {
+    if (!socket?.connected || !roomId) return;
+    broadcastMediaState(media);
+  }, [broadcastMediaState, media, roomId, socket?.connected]);
+
+  const toggleMic = async () => {
+    let stream = getLocalStream();
+    if (!stream) {
+      try {
+        stream = await startLocalStream();
+      } catch {
+        pushToast("Microphone access is required to use the mic.");
+        return;
+      }
+    }
+
     const audioTracks = stream.getAudioTracks();
-    if (!audioTracks.length) return;
-    audioTracks.forEach((t) => {
-      t.enabled = enabled;
+    if (!audioTracks.length) {
+      pushToast("No microphone found on this device.");
+      return;
+    }
+
+    setMedia((prev) => {
+      const enabled = !prev.mic;
+      audioTracks.forEach((track) => {
+        track.enabled = enabled;
+      });
+      return { ...prev, mic: enabled };
     });
-    setMedia((p) => ({ ...p, mic: enabled }));
   };
 
   const toggleCam = () => {
-    if (!localStream) return;
+    if (!localStream || isLocalScreenSharing) return;
     const enabled = !media.cam;
     localStream.getVideoTracks().forEach((t) => {
       t.enabled = enabled;
@@ -180,17 +301,45 @@ const Meeting = () => {
     setMedia((p) => ({ ...p, cam: enabled }));
   };
 
-  const startScreenShare = async () => {
+  const stopScreenShare = useCallback(async () => {
+    if (screenSharingSocketIdRef.current !== socket?.id || stoppingShareRef.current) return;
+    stoppingShareRef.current = true;
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      await endScreenShare(media.cam);
+      setScreenSharingSocketId(null);
+      setScreenSharingBy(null);
+      socket?.emit("screen-share-stop", { roomId, user });
+    } finally {
+      stoppingShareRef.current = false;
+    }
+  }, [endScreenShare, media.cam, roomId, socket, user]);
+
+  const startScreenShare = async () => {
+    if (isLocalScreenSharing) {
+      await stopScreenShare();
+      return;
+    }
+    try {
+      await startLocalStream();
+      const display = await requestScreenShare();
       const track = display.getVideoTracks()[0];
-      replaceVideoTrack(track);
+      if (!track) {
+        pushToast("No screen capture track available.");
+        return;
+      }
+
+      const surface = getDisplaySurface(track);
+      const tip = getLoopPreventionTip(surface);
+      if (tip) pushToast(tip, "info");
+
+      beginScreenShare(track);
+      setScreenSharingSocketId(socket.id);
+      setScreenSharingBy(user.name || "You");
       socket.emit("screen-share-start", { roomId, user });
-      track.onended = async () => {
-        const cameraTrack = localStream?.getVideoTracks()[0];
-        if (cameraTrack) replaceVideoTrack(cameraTrack);
-        socket.emit("screen-share-stop", { roomId, user });
-      };
+
+      track.addEventListener("ended", () => {
+        if (screenSharingSocketIdRef.current === socket.id) stopScreenShare();
+      });
     } catch (error) {
       pushToast("Screen sharing could not start.");
     }
@@ -201,13 +350,29 @@ const Meeting = () => {
   return (
     <div className="relative flex h-[calc(100vh-57px)] flex-col">
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <div className="min-h-0 flex-1">
-          <div className="flex items-center justify-between px-3 py-2">
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center justify-between px-3 py-2">
             <p className="text-sm text-slate-300">Room: {roomId}</p>
             <button onClick={() => setShowPoll((p) => !p)} className="rounded bg-slate-800 px-3 py-1 text-xs">Poll</button>
           </div>
-          {screenSharingBy && <p className="px-3 text-xs text-cyan-300">{screenSharingBy} is sharing screen</p>}
-          <VideoGrid localVideoRef={localVideoRef} remoteStreams={remoteStreams} />
+          {screenSharingBy && !isLocalScreenSharing && (
+            <p className="shrink-0 px-3 pb-1 text-xs text-cyan-300 transition-opacity duration-300">
+              {screenSharingBy} is sharing screen
+            </p>
+          )}
+          <div className="min-h-0 flex-1">
+            <VideoGrid
+              localVideoRef={localVideoRef}
+              remoteStreams={remoteStreams}
+              participants={participants}
+              localUser={user}
+              socketId={socket?.id}
+              media={media}
+              participantMedia={participantMedia}
+              screenSharingSocketId={screenSharingSocketId}
+              isLocalScreenSharing={isLocalScreenSharing}
+            />
+          </div>
         </div>
         <div className="h-72 w-full lg:h-full lg:w-80 lg:min-w-80">
           <ChatPanel
@@ -288,7 +453,9 @@ const Meeting = () => {
         <div className="flex gap-2">
           <button onClick={toggleMic} className="rounded bg-slate-800 px-3 py-2 text-sm">{media.mic ? "Mic On" : "Mic Off"}</button>
           <button onClick={toggleCam} className="rounded bg-slate-800 px-3 py-2 text-sm">{media.cam ? "Cam On" : "Cam Off"}</button>
-          <button onClick={startScreenShare} className="rounded bg-slate-800 px-3 py-2 text-sm">Share Screen</button>
+          <button onClick={startScreenShare} className="rounded bg-slate-800 px-3 py-2 text-sm">
+            {isLocalScreenSharing ? "Stop Share" : "Share Screen"}
+          </button>
           <button onClick={() => setShowBoard((b) => !b)} className="rounded bg-slate-800 px-3 py-2 text-sm">Whiteboard</button>
         </div>
         <ReactionBar onSend={(reaction) => socket.emit("send-reaction", { roomId, reaction, sender: user.name })} />
@@ -300,19 +467,20 @@ const Meeting = () => {
       <Whiteboard socket={socket} roomId={roomId} open={showBoard} onClose={() => setShowBoard(false)} />
 
       <div className="pointer-events-none absolute inset-0">
-        {floatingReactions.map((r, idx) => (
-          <span
-            key={r.id}
-            className="absolute text-3xl"
-            style={{
-              left: `${20 + (idx % 6) * 12}%`,
-              bottom: `${10 + idx * 2}%`,
-              animation: "floatUp 1.6s ease-out forwards"
-            }}
-          >
-            {r.reaction}
-          </span>
-        ))}
+        {!isLocalScreenSharing &&
+          floatingReactions.map((r, idx) => (
+            <span
+              key={r.id}
+              className="absolute text-3xl"
+              style={{
+                left: `${20 + (idx % 6) * 12}%`,
+                bottom: `${10 + idx * 2}%`,
+                animation: "floatUp 1.6s ease-out forwards"
+              }}
+            >
+              {r.reaction}
+            </span>
+          ))}
       </div>
 
       <div className="pointer-events-none absolute right-3 top-3 z-50 space-y-2">

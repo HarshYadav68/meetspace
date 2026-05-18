@@ -12,6 +12,7 @@ const useWebRTC = (socket, roomId, user) => {
   const [localStream, setLocalStream] = useState(null);
   const localStreamRef = useRef(null);
   const peerConnections = useRef({});
+  const cameraTrackRef = useRef(null);
 
   const startLocalStream = useCallback(async () => {
     if (localStreamRef.current) return localStreamRef.current;
@@ -20,6 +21,8 @@ const useWebRTC = (socket, roomId, user) => {
     setLocalStream(stream);
     return stream;
   }, []);
+
+  const getLocalStream = useCallback(() => localStreamRef.current || localStream, [localStream]);
 
   const createPeerConnection = useCallback(
     (targetSocketId, stream) => {
@@ -71,14 +74,82 @@ const useWebRTC = (socket, roomId, user) => {
     });
   }, []);
 
+  const beginScreenShare = useCallback(
+    (screenTrack) => {
+      const stream = localStreamRef.current;
+      if (!stream) return;
+
+      const currentVideo = stream.getVideoTracks()[0];
+      if (currentVideo && currentVideo !== screenTrack) {
+        cameraTrackRef.current = currentVideo;
+        stream.removeTrack(currentVideo);
+      }
+
+      if (!stream.getVideoTracks().includes(screenTrack)) {
+        stream.addTrack(screenTrack);
+      }
+
+      replaceVideoTrack(screenTrack);
+      setLocalStream(stream);
+    },
+    [replaceVideoTrack]
+  );
+
+  const endScreenShare = useCallback(
+    async (camEnabled = true) => {
+      const stream = localStreamRef.current;
+      if (!stream) return;
+
+      const screenTrack = stream.getVideoTracks().find((t) => t !== cameraTrackRef.current);
+      if (screenTrack) {
+        stream.removeTrack(screenTrack);
+        screenTrack.stop();
+      }
+
+      let cameraTrack = cameraTrackRef.current;
+      if (!cameraTrack || cameraTrack.readyState === "ended") {
+        const fresh = await navigator.mediaDevices.getUserMedia({ video: true });
+        cameraTrack = fresh.getVideoTracks()[0];
+        cameraTrackRef.current = cameraTrack;
+      }
+
+      if (!stream.getVideoTracks().includes(cameraTrack)) {
+        stream.addTrack(cameraTrack);
+      }
+      cameraTrack.enabled = camEnabled;
+
+      replaceVideoTrack(cameraTrack);
+      setLocalStream(stream);
+    },
+    [replaceVideoTrack]
+  );
+
+  const removeRemotePeer = useCallback((socketId) => {
+    const pc = peerConnections.current[socketId];
+    if (pc) {
+      pc.close();
+      delete peerConnections.current[socketId];
+    }
+    setRemoteStreams((prev) => {
+      if (!prev[socketId]) return prev;
+      const next = { ...prev };
+      delete next[socketId];
+      return next;
+    });
+  }, []);
+
   return {
     localStream,
     remoteStreams,
     peerConnections,
     startLocalStream,
+    getLocalStream,
     createPeerConnection,
     handleRoomUsers,
-    replaceVideoTrack
+    replaceVideoTrack,
+    beginScreenShare,
+    endScreenShare,
+    removeRemotePeer
   };
 };
 
