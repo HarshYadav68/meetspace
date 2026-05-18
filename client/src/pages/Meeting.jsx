@@ -201,7 +201,7 @@ const Meeting = () => {
       const existingPc = peerConnections.current[from];
       if (existingPc?.signalingState === "stable" && existingPc.currentRemoteDescription) return;
       const stream = localStream || (await startLocalStream());
-      const pc = createPeerConnection(from, stream);
+      const pc = await createPeerConnection(from, stream);
       if (pc.signalingState === "have-local-offer" && socket.id > from) {
         await pc.setLocalDescription({ type: "rollback" });
       }

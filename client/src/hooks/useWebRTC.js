@@ -1,11 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-
-const rtcConfig = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" }
-  ]
-};
+import { getIceServers } from "../utils/iceServers";
 
 const useWebRTC = (socket, roomId, user) => {
   const [remoteStreams, setRemoteStreams] = useState({});
@@ -13,6 +7,14 @@ const useWebRTC = (socket, roomId, user) => {
   const localStreamRef = useRef(null);
   const peerConnections = useRef({});
   const cameraTrackRef = useRef(null);
+  const iceServersRef = useRef(null);
+
+  const ensureIceServers = useCallback(async () => {
+    if (!iceServersRef.current) {
+      iceServersRef.current = await getIceServers();
+    }
+    return iceServersRef.current;
+  }, []);
 
   const startLocalStream = useCallback(async () => {
     if (localStreamRef.current) return localStreamRef.current;
@@ -25,9 +27,11 @@ const useWebRTC = (socket, roomId, user) => {
   const getLocalStream = useCallback(() => localStreamRef.current || localStream, [localStream]);
 
   const createPeerConnection = useCallback(
-    (targetSocketId, stream) => {
+    async (targetSocketId, stream) => {
       if (peerConnections.current[targetSocketId]) return peerConnections.current[targetSocketId];
-      const pc = new RTCPeerConnection(rtcConfig);
+
+      const iceServers = await ensureIceServers();
+      const pc = new RTCPeerConnection({ iceServers });
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
       pc.ontrack = (event) => {
@@ -47,7 +51,7 @@ const useWebRTC = (socket, roomId, user) => {
       peerConnections.current[targetSocketId] = pc;
       return pc;
     },
-    [socket]
+    [ensureIceServers, socket]
   );
 
   const handleRoomUsers = useCallback(
@@ -58,7 +62,7 @@ const useWebRTC = (socket, roomId, user) => {
         if (socket.id > socketId) continue;
         const existingPc = peerConnections.current[socketId];
         if (existingPc?.currentLocalDescription) continue;
-        const pc = createPeerConnection(socketId, stream);
+        const pc = await createPeerConnection(socketId, stream);
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit("offer", { roomId, targetSocketId: socketId, offer, from: socket.id, user });
