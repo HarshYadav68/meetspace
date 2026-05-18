@@ -18,7 +18,7 @@ const Home = () => {
   return (
     <div className="mx-auto max-w-3xl p-6 text-center">
       <h1 className="text-4xl font-bold">MeetSpace</h1>
-      <p className="mt-3 text-slate-300">Your lightweight Zoom-like MERN collaboration room.</p>
+      <p className="mt-3 text-slate-300">Your lightweight privacy first collaboration room.</p>
       <div className="mt-8 flex flex-col items-center gap-3 sm:flex-row sm:justify-center">
         <button onClick={createMeeting} className="rounded bg-cyan-600 px-5 py-3">
           Create Meeting
